@@ -22,12 +22,18 @@ class CameraStreamer:
             raise IOError(f"Cannot open camera {src}")
 
         # --- Camera Settings ---
+        #self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        #self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FPS, 30)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) # Set to manual exposure mode
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, 5) # Set exposure to 5
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) # Set to auto exposure mode
+        #self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) # Set to manual exposure mode
+        #self.cap.set(cv2.CAP_PROP_EXPOSURE, 5) # Set exposure to 5
+
+        fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+        print(f"Current FOURCC code: {fourcc.to_bytes(4, 'little').decode('ascii')}")
 
         self.ret, self.frame = self.cap.read()
         self.stopped = False
@@ -86,7 +92,7 @@ class YoloArucoDetectorNode(Node):
         
         # --- Detection Area Polygons ---
         self.polygon1 = np.array([[203, 0], [256, 185], [0, 185], [0, 0]], np.int32)
-        self.polygon2 = np.array([[250, 531], [250, 671], [0, 671], [0, 531]], np.int32)
+        self.polygon2 = np.array([[200, 531], [200, 671], [0, 671], [0, 531]], np.int32)
 
         # --- Model Initialization ---
         self.get_logger().info("Loading YOLOv8 model...")
