@@ -1,5 +1,4 @@
-# global-cam
-# YOLO and ArUco Stream with ROS2 Integration
+# Global Camera YOLO and ArUco Stream with ROS2 Integration
 
 This project provides a real-time video stream processing application that combines YOLO object detection and ArUco marker detection. It leverages multi-threading for efficient camera frame acquisition and publishes detection results to ROS2 topics. The application also applies perspective transformation to a specific region of interest and visualizes the results.
 
