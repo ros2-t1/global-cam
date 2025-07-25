@@ -1,0 +1,9 @@
+[CAMERA_PARAMS]
+camera_name = camera1
+resolution = [1920 1080]
+cx = 999.31995
+cy = 569.28861
+fx = 1185.96684
+fy = 890.7003
+distortion_model = plumb_bob
+dist = [-9.413361e-02 -8.374589e-04 3.176887e-04 -3.987077e-04 3.289896e-03 0.000000e+00 0.000000e+00 0.000000e+00 ]
