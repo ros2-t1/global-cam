@@ -91,8 +91,9 @@ class YoloArucoDetectorNode(Node):
         self.dst_pts = np.float32([[0, 0], [0, self.dst_height], [self.dst_width, self.dst_height], [self.dst_width, 0]])
         
         # --- Detection Area Polygons ---
-        self.polygon1 = np.array([[203, 0], [256, 185], [0, 185], [0, 0]], np.int32)
-        self.polygon2 = np.array([[200, 531], [200, 671], [0, 671], [0, 531]], np.int32)
+        #self.polygon1 = np.array([[203, 0], [256, 185], [0, 185], [0, 0]], np.int32)
+        self.polygon1 = np.array([[256, 0], [256, 185], [0, 185], [0, 0]], np.int32)
+        self.polygon2 = np.array([[240, 531], [240, 671], [0, 671], [0, 531]], np.int32)
 
         # --- Model Initialization ---
         self.get_logger().info("Loading YOLOv8 model...")
@@ -100,7 +101,8 @@ class YoloArucoDetectorNode(Node):
         self.get_logger().info("YOLOv8 model loaded successfully.")
 
         self.get_logger().info("Initializing ArUco detector...")
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+        #self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_7X7_250)
         self.aruco_params = cv2.aruco.DetectorParameters()
         self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         self.marker_length = 0.1 # 10cm
@@ -258,11 +260,17 @@ class YoloArucoDetectorNode(Node):
 
         # Display
         cv2.imshow(self.window_name, display_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             self.get_logger().info("'q' pressed, shutting down.")
             self.camera_streamer.stop()
             cv2.destroyAllWindows()
             rclpy.shutdown()
+        elif key == ord(' '):
+            timestamp = int(time.time())
+            filename = f"yolo_aruco_display_{timestamp}.png"
+            cv2.imwrite(filename, yolo_annotated_frame)
+            self.get_logger().info(f"Saved display frame: {filename}")
 
     def destroy_node(self):
         self.camera_streamer.stop()
