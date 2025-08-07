@@ -77,9 +77,9 @@ class YoloArucoDetectorNode(Node):
                                        [0, 0, 1]], dtype=np.float32)
         self.dist_coeffs = np.array([-9.413361e-02, -8.374589e-04, 3.176887e-04, -3.987077e-04, 3.289896e-03, 0.0, 0.0, 0.0], dtype=np.float32)
         
-        self.crop_x_min, self.crop_y_min = 302, 140
-        self.crop_x_max, self.crop_y_max = 1672, 818
-        self.src_pts_original = np.float32([[344, 140], [302, 810], [1672, 818], [1640, 157]])
+        self.crop_x_min, self.crop_y_min = 390, 200
+        self.crop_x_max, self.crop_y_max = 1580, 780
+        self.src_pts_original = np.float32([[432, 200], [390, 772], [1580, 780], [1548, 217]])
 
         # --- Perspective Transform Destination ---
         width_top = np.linalg.norm(self.src_pts_original[3] - self.src_pts_original[0])
@@ -91,20 +91,22 @@ class YoloArucoDetectorNode(Node):
         self.dst_pts = np.float32([[0, 0], [0, self.dst_height], [self.dst_width, self.dst_height], [self.dst_width, 0]])
         
         # --- Detection Area Polygons ---
-        #self.polygon1 = np.array([[203, 0], [256, 185], [0, 185], [0, 0]], np.int32)
-        self.polygon1 = np.array([[256, 0], [256, 185], [0, 185], [0, 0]], np.int32)
-        self.polygon2 = np.array([[240, 531], [240, 671], [0, 671], [0, 531]], np.int32)
+        self.polygon1 = np.array([[230, 0], [230, 158], [0, 158], [0, 0]], np.int32)
+        self.polygon2 = np.array([[185, 465], [185, 580], [0, 580], [0, 465]], np.int32)
 
         # --- Model Initialization ---
         self.get_logger().info("Loading YOLOv8 model...")
-        self.yolo_model = YOLO('yolo_model/yolov8s.pt') # GPU will be used automatically if available
+        self.yolo_model = YOLO('yolo_model/yolov8n.pt') # Use nano model for higher FPS
         self.get_logger().info("YOLOv8 model loaded successfully.")
 
         self.get_logger().info("Initializing ArUco detector...")
-        #self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_7X7_250)
         self.aruco_params = cv2.aruco.DetectorParameters()
         self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementWinSize = 20
+        self.aruco_params.cornerRefinementMaxIterations = 50
+        self.aruco_params.cornerRefinementMinAccuracy = 0.01
         self.marker_length = 0.1 # 10cm
         self.get_logger().info("ArUco detector initialized.")
 
@@ -113,152 +115,151 @@ class YoloArucoDetectorNode(Node):
         self.camera_streamer = CameraStreamer(src=0).start()
         self.get_logger().info("Camera stream started.")
 
-        # --- Main Loop Timer ---
-        self.timer = self.create_timer(0.01, self.process_frame) # Process as fast as possible
-        self.prev_processing_time = time.time()
+        # --- Pre-calculate Undistortion Map for Optimization ---
+        self.get_logger().info("Calculating undistortion map...")
+        # Get a sample frame to find dimensions
+        ret, sample_frame = self.camera_streamer.read()
+        while not ret or sample_frame is None: # Ensure we get a valid frame
+            self.get_logger().warn("Waiting for a valid camera frame to calculate map...")
+            time.sleep(0.1)
+            ret, sample_frame = self.camera_streamer.read()
+
+        h, w = sample_frame.shape[:2]
+        
+        # Get the optimal new camera matrix and calculate the undistortion maps
+        new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(self.camera_matrix, self.dist_coeffs, (w, h), 1, (w, h))
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(self.camera_matrix, self.dist_coeffs, None, new_camera_matrix, (w, h), 5)
+        self.get_logger().info("Undistortion map calculated.")
+
+        # --- Shared data between threads ---
+        self.data_lock = threading.Lock()
+        self.latest_undistorted_frame = None
+        self.latest_aruco_annotated_frame = None
+        self.latest_rvecs, self.latest_tvecs, self.latest_aruco_ids, self.latest_aruco_corners_full_frame = None, None, None, None
+        
+        # --- Perspective Transform Matrix ---
+        src_pts_transformed = np.float32([[(p[0] - self.crop_x_min), (p[1] - self.crop_y_min)] for p in self.src_pts_original])
+        self.M = cv2.getPerspectiveTransform(src_pts_transformed, self.dst_pts)
+
+        # --- Timers for separate processing loops ---
+        self.aruco_timer = self.create_timer(1.0/5.0, self.process_aruco) # Reduced frequency to 5Hz for debugging
+        self.yolo_timer = self.create_timer(1.0/15.0, self.process_yolo_and_visualize)
+        
+        self.prev_yolo_time = time.time()
         self.window_name = "YOLO and ArUco Detection"
 
-    def process_frame(self):
-        start_time = time.time()
-
+    def process_aruco(self):
+        self.get_logger().info("Processing ArUco frame...", throttle_duration_sec=2)
         ret, frame = self.camera_streamer.read()
         if not ret:
-            self.get_logger().warn("Could not read frame from camera stream.")
+            self.get_logger().warn("Could not read frame from camera stream.", throttle_duration_sec=5)
             return
 
-        # 1. UNDISTORTION
-        undistorted_frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+        # 1. UNDISTORTION (using pre-calculated map)
+        undistorted_frame = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
+        aruco_annotated_frame = undistorted_frame.copy()
 
         # 2. ARUCO DETECTION (on cropped frame for efficiency)
-        # Create a copy of undistorted_frame for annotation before cropping for PT
-        aruco_annotated_frame = undistorted_frame.copy() 
-        
-        # Perform ArUco detection on the cropped region
         cropped_for_aruco = undistorted_frame[self.crop_y_min:self.crop_y_max, self.crop_x_min:self.crop_x_max]
+        cropped_for_aruco = cv2.cvtColor(cropped_for_aruco, cv2.COLOR_BGR2GRAY)
+        cropped_for_aruco = cv2.bilateralFilter(cropped_for_aruco, 9, 75, 75)
         aruco_corners_cropped, aruco_ids, _ = self.aruco_detector.detectMarkers(cropped_for_aruco)
         
-        rvecs, tvecs = None, None
+        rvecs, tvecs, aruco_corners_full_frame = None, None, None
         if aruco_ids is not None:
-            # Convert cropped_frame coordinates back to original undistorted_frame coordinates
-            aruco_corners_full_frame = []
-            for corner_set in aruco_corners_cropped:
-                # corner_set is (1, 4, 2)
-                # Add crop_x_min and crop_y_min to each corner point
-                transformed_corner_set = corner_set + np.array([self.crop_x_min, self.crop_y_min], dtype=np.float32)
-                aruco_corners_full_frame.append(transformed_corner_set)
+            aruco_corners_full_frame = [c + np.array([self.crop_x_min, self.crop_y_min], dtype=np.float32) for c in aruco_corners_cropped]
             aruco_corners_full_frame = np.array(aruco_corners_full_frame, dtype=np.float32)
 
-            # Estimate pose using full frame coordinates and original camera parameters
             rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(aruco_corners_full_frame, self.marker_length, self.camera_matrix, self.dist_coeffs)
             
-            # Publish ArUco rvecs and tvecs to ROS2 topics
             for i in range(len(aruco_ids)):
-                rvec_msg = Float32MultiArray()
-                rvec_msg.data = rvecs[i].flatten().tolist()
+                rvec_msg = Float32MultiArray(data=rvecs[i].flatten().tolist())
                 self.rvec_publisher_.publish(rvec_msg)
-
-                tvec_msg = Float32MultiArray()
-                tvec_msg.data = tvecs[i].flatten().tolist()
+                tvec_msg = Float32MultiArray(data=tvecs[i].flatten().tolist())
                 self.tvec_publisher_.publish(tvec_msg)
 
-            # Draw detected markers and axes on the full undistorted frame
             cv2.aruco.drawDetectedMarkers(aruco_annotated_frame, aruco_corners_full_frame, aruco_ids)
             for i in range(len(aruco_ids)):
                 cv2.drawFrameAxes(aruco_annotated_frame, self.camera_matrix, self.dist_coeffs, rvecs[i], tvecs[i], self.marker_length * 0.5)
 
-        # 3. PERSPECTIVE TRANSFORM
+        with self.data_lock:
+            self.latest_undistorted_frame = undistorted_frame
+            self.latest_aruco_annotated_frame = aruco_annotated_frame
+            self.latest_rvecs, self.latest_tvecs, self.latest_aruco_ids, self.latest_aruco_corners_full_frame = rvecs, tvecs, aruco_ids, aruco_corners_full_frame
+
+    def process_yolo_and_visualize(self):
+        self.get_logger().info("Processing YOLO frame...", throttle_duration_sec=2)
+        with self.data_lock:
+            undistorted_frame = self.latest_undistorted_frame
+            aruco_annotated_frame = self.latest_aruco_annotated_frame
+            rvecs, tvecs, aruco_ids, aruco_corners_full_frame = self.latest_rvecs, self.latest_tvecs, self.latest_aruco_ids, self.latest_aruco_corners_full_frame
+
+        if undistorted_frame is None:
+            return
+
         cropped_frame = undistorted_frame[self.crop_y_min:self.crop_y_max, self.crop_x_min:self.crop_x_max]
         
-        if cropped_frame.shape[0] > 0 and cropped_frame.shape[1] > 0:
-            src_pts_transformed = np.float32([[(p[0] - self.crop_x_min), (p[1] - self.crop_y_min)] for p in self.src_pts_original])
-            M = cv2.getPerspectiveTransform(src_pts_transformed, self.dst_pts)
-            processed_frame = cv2.warpPerspective(cropped_frame, M, (self.dst_width, self.dst_height))
-        else:
-            processed_frame = np.zeros((self.dst_height, self.dst_width, 3), dtype=np.uint8)
+        if cropped_frame.shape[0] == 0 or cropped_frame.shape[1] == 0:
+            return
+            
+        processed_frame = cv2.warpPerspective(cropped_frame, self.M, (self.dst_width, self.dst_height))
 
-        # 4. YOLO DETECTION (on transformed frame)
         yolo_results = self.yolo_model(processed_frame, verbose=False, classes=0, conf=self.conf_threshold)
         yolo_annotated_frame = yolo_results[0].plot()
 
-        # 5. PROCESS YOLO RESULTS & PUBLISH
-        detection_status = 0 # 0: No person
+        detection_status = 0
         if len(yolo_results[0].boxes) > 0:
-            detection_status = 1 # 1: Person detected outside polygon
+            detection_status = 1
             for box in yolo_results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 bottom_center = (int((x1 + x2) / 2), y2)
-                if cv2.pointPolygonTest(self.polygon1, bottom_center, False) >= 0 or \
-                   cv2.pointPolygonTest(self.polygon2, bottom_center, False) >= 0:
-                    detection_status = 2 # 2: Person detected inside polygon
+                if cv2.pointPolygonTest(self.polygon1, bottom_center, False) >= 0 or cv2.pointPolygonTest(self.polygon2, bottom_center, False) >= 0:
+                    detection_status = 2
                     break
-        
-        msg = Int32()
-        msg.data = detection_status
-        self.publisher_.publish(msg)
+        self.publisher_.publish(Int32(data=detection_status))
 
-        # 6. VISUALIZE ARUCO ON TRANSFORMED FRAME
         if aruco_ids is not None and rvecs is not None:
-            # --- Draw Marker Outlines ---
             all_corners_flat = np.array([c[0] for c in aruco_corners_full_frame]).reshape(-1, 1, 2)
             all_corners_relative = all_corners_flat - [self.crop_x_min, self.crop_y_min]
-            transformed_corners_flat = cv2.perspectiveTransform(all_corners_relative, M)
+            transformed_corners_flat = cv2.perspectiveTransform(all_corners_relative, self.M)
             
             if transformed_corners_flat is not None:
-                transformed_corners = transformed_corners_flat.reshape(-1, 1, 4, 2)
-                cv2.aruco.drawDetectedMarkers(yolo_annotated_frame, transformed_corners, aruco_ids)
+                cv2.aruco.drawDetectedMarkers(yolo_annotated_frame, transformed_corners_flat.reshape(-1, 1, 4, 2), aruco_ids)
 
-            # --- Draw Marker Axes ---
             axis_len = self.marker_length * 0.5
-            axis_points_3d = np.float32([[0, 0, 0], [axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]]).reshape(-1, 3)
-
+            axis_points_3d = np.float32([[0,0,0], [axis_len,0,0], [0,axis_len,0], [0,0,axis_len]]).reshape(-1, 3)
             for i in range(len(aruco_ids)):
-                # Project 3D axis points to 2D image plane (original undistorted)
-                image_points_2d, _ = cv2.projectPoints(axis_points_3d, rvecs[i], tvecs[i], self.camera_matrix, self.dist_coeffs)
-                
-                # Transform 2D points to the perspective-corrected frame
-                image_points_relative = image_points_2d.reshape(-1, 2) - [self.crop_x_min, self.crop_y_min]
-                transformed_axis_points_2d = cv2.perspectiveTransform(image_points_relative.reshape(-1, 1, 2), M)
+                img_pts, _ = cv2.projectPoints(axis_points_3d, rvecs[i], tvecs[i], self.camera_matrix, self.dist_coeffs)
+                img_pts_relative = img_pts.reshape(-1, 2) - [self.crop_x_min, self.crop_y_min]
+                transformed_axis_pts = cv2.perspectiveTransform(img_pts_relative.reshape(-1, 1, 2), self.M)
+                if transformed_axis_pts is not None:
+                    pts = transformed_axis_pts.reshape(-1, 2).astype(int)
+                    cv2.line(yolo_annotated_frame, tuple(pts[0]), tuple(pts[1]), (0,0,255), 2)
+                    cv2.line(yolo_annotated_frame, tuple(pts[0]), tuple(pts[2]), (0,255,0), 2)
+                    cv2.line(yolo_annotated_frame, tuple(pts[0]), tuple(pts[3]), (255,0,0), 2)
 
-                if transformed_axis_points_2d is not None:
-                    # Draw the axes lines on the yolo_annotated_frame
-                    points = transformed_axis_points_2d.reshape(-1, 2).astype(int)
-                    origin_pt = tuple(points[0])
-                    cv2.line(yolo_annotated_frame, origin_pt, tuple(points[1]), (0, 0, 255), 2) # X: Red
-                    cv2.line(yolo_annotated_frame, origin_pt, tuple(points[2]), (0, 255, 0), 2) # Y: Green
-                    cv2.line(yolo_annotated_frame, origin_pt, tuple(points[3]), (255, 0, 0), 2) # Z: Blue
+        cv2.polylines(yolo_annotated_frame, [self.polygon1, self.polygon2], True, (0,255,0), 2)
 
-        # 7. VISUALIZATION & DISPLAY
-        # Draw polygons on YOLO frame
-        cv2.polylines(yolo_annotated_frame, [self.polygon1, self.polygon2], isClosed=True, color=(0, 255, 0), thickness=2)
+        processing_fps = 1 / (time.time() - self.prev_yolo_time)
+        self.prev_yolo_time = time.time()
+        cv2.putText(yolo_annotated_frame, f"YOLO FPS: {int(processing_fps)}", (10, yolo_annotated_frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
 
-        # Calculate and display FPS
-        processing_fps = 1 / (time.time() - self.prev_processing_time)
-        self.prev_processing_time = time.time()
-        cv2.putText(yolo_annotated_frame, f"FPS: {int(processing_fps)}", (10, yolo_annotated_frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # Resize frames for combined view
         h, w = yolo_annotated_frame.shape[:2]
-        aruco_annotated_frame_resized = cv2.resize(aruco_annotated_frame, (w, h))
+        if aruco_annotated_frame is not None:
+            aruco_annotated_frame_resized = cv2.resize(aruco_annotated_frame, (w, h))
+        else:
+            aruco_annotated_frame_resized = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # Combine frames
         combined_frame = cv2.hconcat([aruco_annotated_frame_resized, yolo_annotated_frame])
         
-        # --- Resize for Display ---
-        display_max_width = 1920
-        display_max_height = 1080
+        display_max_width, display_max_height = 1920, 1080
         h, w = combined_frame.shape[:2]
-
-        # Calculate the scaling factor to fit the display
         scale = min(display_max_width / w, display_max_height / h)
-        
         if scale < 1:
-            display_width = int(w * scale)
-            display_height = int(h * scale)
-            display_frame = cv2.resize(combined_frame, (display_width, display_height))
+            display_frame = cv2.resize(combined_frame, (int(w*scale), int(h*scale)))
         else:
             display_frame = combined_frame
 
-        # Display
         cv2.imshow(self.window_name, display_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -267,10 +268,8 @@ class YoloArucoDetectorNode(Node):
             cv2.destroyAllWindows()
             rclpy.shutdown()
         elif key == ord(' '):
-            timestamp = int(time.time())
-            filename = f"yolo_aruco_display_{timestamp}.png"
-            cv2.imwrite(filename, yolo_annotated_frame)
-            self.get_logger().info(f"Saved display frame: {filename}")
+            cv2.imwrite(f"yolo_aruco_display_{int(time.time())}.png", yolo_annotated_frame)
+            self.get_logger().info("Saved display frame.")
 
     def destroy_node(self):
         self.camera_streamer.stop()
@@ -287,6 +286,8 @@ def get_conf_threshold_input():
         except ValueError:
             print("Invalid input. Please enter a number.")
 
+from rclpy.executors import MultiThreadedExecutor
+
 def main(args=None):
     # --- User Input ---
     conf_threshold = get_conf_threshold_input()
@@ -296,12 +297,21 @@ def main(args=None):
     
     try:
         yolo_aruco_node = YoloArucoDetectorNode(conf_threshold)
-        rclpy.spin(yolo_aruco_node)
+        
+        # Use a MultiThreadedExecutor to allow callbacks to run in parallel
+        executor = MultiThreadedExecutor()
+        executor.add_node(yolo_aruco_node)
+        
+        try:
+            executor.spin()
+        finally:
+            executor.shutdown()
+            yolo_aruco_node.destroy_node()
+            
     except (KeyboardInterrupt, SystemExit):
         print("\nShutting down gracefully.")
     finally:
         if rclpy.ok():
-            yolo_aruco_node.destroy_node()
             rclpy.shutdown()
 
 if __name__ == '__main__':
