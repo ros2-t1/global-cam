@@ -29,7 +29,7 @@ CROP_X_MIN, CROP_Y_MIN = 390, 200
 CROP_X_MAX, CROP_Y_MAX = 1580, 780
 
 # --- JPEG Encoding Quality ---
-ENCODE_QUALITY = 50 # 0 to 100, higher is better quality
+ENCODE_QUALITY = 50  # 0 to 100, higher is better quality
 
 # =================================================================================
 # Thread-safe Camera Stream Class
