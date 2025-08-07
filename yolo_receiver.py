@@ -59,7 +59,7 @@ class YoloReceiverNode(Node):
 
         # --- Model Initialization ---
         self.get_logger().info("Loading YOLOv8 model...")
-        self.yolo_model = YOLO('yolo_model/yolov8n.pt')
+        self.yolo_model = YOLO('yolo_model/yolov8s.pt')
         self.get_logger().info("YOLOv8 model loaded successfully.")
 
         # --- Main processing loop via timer ---
