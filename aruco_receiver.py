@@ -36,6 +36,23 @@ class ArucoReceiverNode(Node):
                                        [0, 0, 1]], dtype=np.float32)
         self.dist_coeffs = np.array([-9.413361e-02, -8.374589e-04, 3.176887e-04, -3.987077e-04, 3.289896e-03, 0.0, 0.0, 0.0], dtype=np.float32)
 
+        # --- Perspective Transform Parameters (from yolo_receiver.py) ---
+        self.src_pts_original = np.float32([[432, 200], [390, 772], [1580, 780], [1548, 217]])
+        self.crop_offsets = np.float32([390, 200]) # CROP_X_MIN, CROP_Y_MIN
+        
+        # Adjust src points to be relative to the cropped image
+        src_pts_relative = self.src_pts_original - self.crop_offsets
+
+        width_top = np.linalg.norm(src_pts_relative[3] - src_pts_relative[0])
+        width_bottom = np.linalg.norm(src_pts_relative[2] - src_pts_relative[1])
+        height_left = np.linalg.norm(src_pts_relative[1] - src_pts_relative[0])
+        height_right = np.linalg.norm(src_pts_relative[2] - src_pts_relative[3])
+        self.dst_width = int(max(width_top, width_bottom))
+        self.dst_height = int(max(height_left, height_right))
+        self.dst_pts = np.float32([[0, 0], [0, self.dst_height], [self.dst_width, self.dst_height], [self.dst_width, 0]])
+        
+        self.M = cv2.getPerspectiveTransform(src_pts_relative, self.dst_pts)
+
         # --- ArUco Detector Initialization ---
         self.get_logger().info("Initializing ArUco detector...")
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_7X7_250)
@@ -61,20 +78,28 @@ class ArucoReceiverNode(Node):
             # 2. Decode the JPEG image
             encoded_frame = data['frame']
             cropped_frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
+
+            # 3. Apply Perspective Transform for visualization
+            transformed_frame = cv2.warpPerspective(cropped_frame, self.M, (self.dst_width, self.dst_height))
             
-            # 3. Pre-process for ArUco detection
+            # 4. Pre-process for ArUco detection (on the original cropped frame)
             gray_frame = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2GRAY)
             filtered_frame = cv2.bilateralFilter(gray_frame, 5, 50, 50)
 
-            # 4. Detect ArUco markers
+            # 5. Detect ArUco markers
             aruco_corners_cropped, aruco_ids, _ = self.aruco_detector.detectMarkers(filtered_frame)
 
-            if aruco_ids is not None:
-                # Draw markers on the cropped frame for display
-                display_frame = cropped_frame.copy()
-                cv2.aruco.drawDetectedMarkers(display_frame, aruco_corners_cropped, aruco_ids)
+            display_frame = transformed_frame.copy()
 
-                # 5. Convert corner coordinates to full frame coordinates
+            if aruco_ids is not None:
+                # 6. Transform marker corners for visualization
+                transformed_corners = [
+                    cv2.perspectiveTransform(c.reshape(-1, 1, 2), self.M)
+                    for c in aruco_corners_cropped
+                ]
+                cv2.aruco.drawDetectedMarkers(display_frame, transformed_corners, aruco_ids)
+
+                # 7. Convert corner coordinates to full frame for pose estimation
                 crop_x_min, crop_y_min = data['offsets']
                 aruco_corners_full_frame = [
                     c + np.array([crop_x_min, crop_y_min], dtype=np.float32) 
@@ -82,24 +107,30 @@ class ArucoReceiverNode(Node):
                 ]
                 aruco_corners_full_frame = np.array(aruco_corners_full_frame, dtype=np.float32)
 
-                # 6. Estimate pose
+                # 8. Estimate pose (using non-transformed points)
                 rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
                     aruco_corners_full_frame, self.marker_length, self.camera_matrix, self.dist_coeffs
                 )
                 
-                # Draw axis for each marker on the display frame
+                # 9. Draw axis for each marker on the transformed display frame
                 axis_len = self.marker_length * 0.5
                 axis_points_3d = np.float32([[0,0,0], [axis_len,0,0], [0,axis_len,0], [0,0,axis_len]]).reshape(-1, 3)
                 for i in range(len(rvecs)):
+                    # Project 3D points to 2D image plane (full frame)
                     img_pts, _ = cv2.projectPoints(axis_points_3d, rvecs[i], tvecs[i], self.camera_matrix, self.dist_coeffs)
+                    
                     # Adjust projected points to be relative to the cropped frame
                     img_pts_relative = img_pts.reshape(-1, 2) - np.array([crop_x_min, crop_y_min], dtype=np.float32)
-                    pts = img_pts_relative.astype(int)
+                    
+                    # Transform the relative 2D points to the perspective-corrected space
+                    transformed_axis_pts = cv2.perspectiveTransform(img_pts_relative.reshape(-1, 1, 2), self.M)
+                    
+                    pts = transformed_axis_pts.reshape(-1, 2).astype(int)
                     cv2.line(display_frame, tuple(pts[0]), tuple(pts[1]), (0,0,255), 2) # X-axis (Red)
                     cv2.line(display_frame, tuple(pts[0]), tuple(pts[2]), (0,255,0), 2) # Y-axis (Green)
                     cv2.line(display_frame, tuple(pts[0]), tuple(pts[3]), (255,0,0), 2) # Z-axis (Blue)
 
-                # 7. Publish results to ROS2 topics
+                # 10. Publish results to ROS2 topics
                 for i in range(len(aruco_ids)):
                     rvec_msg = Float32MultiArray(data=rvecs[i].flatten().tolist())
                     self.rvec_publisher_.publish(rvec_msg)
@@ -107,11 +138,8 @@ class ArucoReceiverNode(Node):
                     tvec_msg = Float32MultiArray(data=tvecs[i].flatten().tolist())
                     self.tvec_publisher_.publish(tvec_msg)
                 
-                # Display the result
-                cv2.imshow('ArUco Receiver', display_frame)
-            else:
-                # If no markers are detected, still show the frame
-                cv2.imshow('ArUco Receiver', cropped_frame)
+            # Display the result (transformed frame with or without markers)
+            cv2.imshow('ArUco Receiver', display_frame)
 
             # Check for 'q' key to exit
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -128,7 +156,7 @@ def main(args=None):
     try:
         rclpy.spin(aruco_receiver_node)
     except KeyboardInterrupt:
-        print("\nShutting down ArUco receiver.")
+        print("Shutting down ArUco receiver.")
     finally:
         aruco_receiver_node.destroy_node()
         rclpy.shutdown()
